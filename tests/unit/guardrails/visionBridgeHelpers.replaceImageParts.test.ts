@@ -251,3 +251,96 @@ test("replaceImageParts handles mixed images and text", () => {
   assert.strictEqual(content[2].type, "text");
   assert.strictEqual(content[2].text, "[Image 2]: Second image");
 });
+
+test("replaceImageParts recursively replaces images in Claude tool_result content", () => {
+  const body = {
+    model: "deepseek/deepseek-v4-pro",
+    messages: [
+      {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "tool-screenshot",
+            content: [
+              { type: "text", text: "Screenshot captured." },
+              {
+                type: "image",
+                source: {
+                  type: "base64",
+                  media_type: "image/png",
+                  data: "bmVzdGVkLWltYWdl",
+                },
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  };
+
+  const result = replaceImageParts(body, ["[Image 1]: A terminal screenshot"]);
+  const toolResult = result.messages[0].content[0] as {
+    type: string;
+    content: Array<{ type: string; text?: string }>;
+  };
+
+  assert.strictEqual(toolResult.type, "tool_result");
+  assert.deepStrictEqual(toolResult.content, [
+    { type: "text", text: "Screenshot captured." },
+    { type: "text", text: "[Image 1]: A terminal screenshot" },
+  ]);
+  assert.equal(JSON.stringify(result).includes("bmVzdGVkLWltYWdl"), false);
+});
+
+test("replaceImageParts preserves images without a matching description", () => {
+  const body = {
+    model: "test",
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "image_url", image_url: { url: "https://example.com/first.png" } },
+          { type: "image_url", image_url: { url: "https://example.com/second.png" } },
+        ],
+      },
+    ],
+  };
+
+  const result = replaceImageParts(body, ["[Image 1]: First"]);
+  const content = result.messages[0].content as Array<{
+    type: string;
+    text?: string;
+    image_url?: { url: string };
+  }>;
+
+  assert.deepStrictEqual(content[0], { type: "text", text: "[Image 1]: First" });
+  assert.deepStrictEqual(content[1], {
+    type: "image_url",
+    image_url: { url: "https://example.com/second.png" },
+  });
+});
+
+test("replaceImageParts uses input_text for Responses-style input_image blocks", () => {
+  const body = {
+    model: "test",
+    messages: [
+      {
+        role: "user",
+        content: [
+          {
+            type: "input_image",
+            image_url: "https://example.com/responses.png",
+          },
+        ],
+      },
+    ],
+  };
+
+  const result = replaceImageParts(body, ["[Image 1]: Responses image"]);
+
+  assert.deepStrictEqual(result.messages[0].content[0], {
+    type: "input_text",
+    text: "[Image 1]: Responses image",
+  });
+});

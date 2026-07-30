@@ -141,3 +141,73 @@ test("extractImageParts preserves order of images", () => {
   assert.strictEqual(result[1].partIndex, 3);
   assert.strictEqual(result[2].partIndex, 4);
 });
+
+test("extractImageParts finds images nested inside Claude tool_result content", () => {
+  const messages = [
+    {
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: "tool-screenshot",
+          content: [
+            { type: "text", text: "Screenshot captured." },
+            {
+              type: "image",
+              source: {
+                type: "base64",
+                media_type: "image/png",
+                data: "bmVzdGVkLWltYWdl",
+              },
+            },
+          ],
+        },
+      ],
+    },
+  ] as unknown as RequestMessage[];
+
+  const result = extractImageParts(messages);
+
+  assert.strictEqual(result.length, 1);
+  assert.deepStrictEqual(result[0].contentPath, [0, 1]);
+  assert.strictEqual(result[0].messageIndex, 0);
+  assert.strictEqual(result[0].partIndex, 0);
+  assert.strictEqual(result[0].imageUrl, "data:image/png;base64,bmVzdGVkLWltYWdl");
+});
+
+test("extractImageParts supports Anthropic URL sources and OpenAI shorthand URLs", () => {
+  const messages = [
+    {
+      role: "user",
+      content: [
+        {
+          type: "image",
+          source: { type: "url", url: "https://example.com/anthropic.png" },
+        },
+        {
+          type: "image_url",
+          image_url: "https://example.com/openai.png",
+        },
+        {
+          type: "input_image",
+          image_url: "https://example.com/responses.png",
+        },
+      ],
+    },
+  ] as unknown as RequestMessage[];
+
+  const result = extractImageParts(messages);
+
+  assert.deepStrictEqual(
+    result.map((part) => part.imageUrl),
+    [
+      "https://example.com/anthropic.png",
+      "https://example.com/openai.png",
+      "https://example.com/responses.png",
+    ]
+  );
+  assert.deepStrictEqual(
+    result.map((part) => part.contentPath),
+    [[0], [1], [2]]
+  );
+});

@@ -9,6 +9,8 @@ import assert from "node:assert/strict";
 const { VisionBridgeGuardrail } = await import("../../../src/lib/guardrails/visionBridge.ts");
 const { resetGuardrailsForTests } = await import("../../../src/lib/guardrails/registry.ts");
 const { getResolvedModelCapabilities } = await import("../../../src/lib/modelCapabilities.ts");
+const { translateRequest } = await import("../../../open-sse/translator/index.ts");
+const { FORMATS } = await import("../../../open-sse/translator/formats.ts");
 import type { GuardrailContext } from "../../../src/lib/guardrails/base.ts";
 import type { VisionModelConfig } from "../../../src/lib/guardrails/visionBridgeHelpers.ts";
 
@@ -472,6 +474,186 @@ test("VB-S03: preserves the original image when the vision API fails (#4012)", a
   assert.strictEqual(unavailPart, undefined);
 });
 
+test("VB-DS-01: ds/deepseek-v4-pro replaces images with bridge text", async () => {
+  const guardrail = createGuardrail({
+    deps: {
+      hasUsableCredentials: async (model: string) => (model === "ds/deepseek-v4-pro" ? true : null),
+    },
+  });
+
+  const payload = createPayload({
+    model: "ds/deepseek-v4-pro",
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "What is this?" },
+          {
+            type: "image",
+            source: {
+              type: "base64",
+              media_type: "image/png",
+              data: "aW1hZ2UtYnl0ZXM=",
+            },
+          },
+        ],
+      },
+    ],
+  });
+
+  const result = await guardrail.preCall(payload, createContext({ model: "ds/deepseek-v4-pro" }));
+  assert.strictEqual(result.block, false);
+  assert.strictEqual(visionCallCount, 1);
+
+  const modified = result.modifiedPayload as {
+    messages: Array<{ content: Array<{ type: string; text?: string }> }>;
+  };
+  const content = modified.messages[0].content;
+  assert.equal(
+    content.some((part) => part.type === "image"),
+    false
+  );
+  assert.equal(
+    content.some(
+      (part) => part.type === "text" && part.text === `[Image 1]: ${mockVisionResponse}`
+    ),
+    true
+  );
+});
+
+test("VB-DS-02: a failed bridge never forwards raw images to text-only DeepSeek", async () => {
+  shouldVisionFail = true;
+  const guardrail = createGuardrail({
+    deps: {
+      hasUsableCredentials: async (model: string) => (model === "ds/deepseek-v4-pro" ? true : null),
+    },
+  });
+
+  const payload = createPayload({
+    model: "ds/deepseek-v4-pro",
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "What is this?" },
+          {
+            type: "image_url",
+            image_url: { url: "https://example.com/image.png" },
+          },
+        ],
+      },
+    ],
+  });
+
+  const result = await guardrail.preCall(payload, createContext({ model: "ds/deepseek-v4-pro" }));
+  assert.strictEqual(result.block, false);
+
+  const modified = result.modifiedPayload as {
+    messages: Array<{ content: Array<{ type: string; text?: string }> }>;
+  };
+  const content = modified.messages[0].content;
+  assert.equal(
+    content.some((part) => part.type === "image_url"),
+    false
+  );
+  assert.equal(
+    content.some(
+      (part) => part.type === "text" && part.text === "[Image 1]: Image description unavailable."
+    ),
+    true
+  );
+});
+
+test("VB-DS-03: final DeepSeek payload contains no image_url from nested Claude tool results", async () => {
+  const guardrail = createGuardrail({
+    deps: {
+      hasUsableCredentials: async (model: string) => (model === "ds/deepseek-v4-pro" ? true : null),
+    },
+  });
+
+  const payload = createPayload({
+    model: "ds/deepseek-v4-pro",
+    messages: [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "tool-screenshot",
+            name: "screenshot",
+            input: {},
+          },
+        ],
+      },
+      {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "tool-screenshot",
+            content: [
+              { type: "text", text: "Screenshot captured." },
+              {
+                type: "image",
+                source: {
+                  type: "base64",
+                  media_type: "image/png",
+                  data: "aGlzdG9yaWNhbC1zY3JlZW5zaG90",
+                },
+              },
+            ],
+          },
+        ],
+      },
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "Compare that screenshot with this image." },
+          {
+            type: "image",
+            source: {
+              type: "base64",
+              media_type: "image/png",
+              data: "Y3VycmVudC1pbWFnZQ==",
+            },
+          },
+        ],
+      },
+    ],
+  });
+
+  const bridged = await guardrail.preCall(payload, createContext({ model: "ds/deepseek-v4-pro" }));
+  assert.strictEqual(bridged.block, false);
+
+  const translated = translateRequest(
+    FORMATS.CLAUDE,
+    FORMATS.OPENAI,
+    "deepseek-v4-pro",
+    bridged.modifiedPayload ?? payload,
+    true,
+    null,
+    "deepseek"
+  );
+  const finalJson = JSON.stringify(translated);
+
+  assert.equal(visionCallCount, 2, "both historical and current images must be described");
+  assert.equal(
+    finalJson.includes('"type":"image_url"'),
+    false,
+    `final DeepSeek payload still contains image_url: ${finalJson}`
+  );
+  assert.equal(
+    finalJson.includes("aGlzdG9yaWNhbC1zY3JlZW5zaG90"),
+    false,
+    "historical screenshot base64 must not survive translation"
+  );
+  assert.equal(
+    finalJson.includes("Y3VycmVudC1pbWFnZQ=="),
+    false,
+    "current image base64 must not survive translation"
+  );
+});
+
 test("VB-S03: logs warning when vision API fails (via combo mapping)", async () => {
   shouldVisionFail = true;
   let warningLogged = false;
@@ -515,13 +697,13 @@ test("VB-S03: logs warning when vision API fails (via combo mapping)", async () 
   assert.strictEqual(warningLogged, true);
 });
 
-// ── VB-S09: Image count limit (via combo mapping) ──────────────────────────
+// ── VB-S09: Image count limit for text-only targets ────────────────────────
 
-test("VB-S09: respects maxImages setting in combo mapping path", async () => {
+test("VB-S09: respects maxImages without leaking remaining images to a text-only target", async () => {
   mockSettings.visionBridgeMaxImages = 2;
   const guardrail = createGuardrail({
     deps: {
-      checkModelHasComboMapping: async (_model: string) => true,
+      hasUsableCredentials: async (model: string) => (model === "ds/deepseek-v4-pro" ? true : null),
     },
   });
 
@@ -531,7 +713,7 @@ test("VB-S09: respects maxImages setting in combo mapping path", async () => {
   }));
 
   const payload = createPayload({
-    model: "openai/gpt-4o",
+    model: "ds/deepseek-v4-pro",
     messages: [
       {
         role: "user",
@@ -540,10 +722,21 @@ test("VB-S09: respects maxImages setting in combo mapping path", async () => {
     ],
   });
 
-  await guardrail.preCall(payload, createContext({ model: "openai/gpt-4o" }));
+  const result = await guardrail.preCall(payload, createContext({ model: "ds/deepseek-v4-pro" }));
 
   // Should only call vision API for 2 images (maxImages=2)
   assert.strictEqual(visionCallCount, 2);
+  const finalJson = JSON.stringify(result.modifiedPayload);
+  assert.equal(
+    finalJson.includes('"type":"image_url"'),
+    false,
+    "images beyond maxImages must become safe text placeholders for a text-only target"
+  );
+  assert.equal(
+    finalJson.includes("Vision Bridge image limit was reached"),
+    true,
+    "the payload should disclose why remaining images were not described"
+  );
 });
 
 // ── VB-S10: Meta information returned (reroute path) ───────────────────────
@@ -771,21 +964,11 @@ test("VB-CRED-02: does NOT reroute to a vision model known to lack credentials",
 });
 
 test("isProviderConnectionUsable rejects noauth without api key", async () => {
-  const { isProviderConnectionUsable } = await import(
-    "../../../src/lib/guardrails/visionBridge.ts"
-  );
-  assert.strictEqual(
-    isProviderConnectionUsable({ authType: "noauth", apiKey: null }),
-    false
-  );
-  assert.strictEqual(
-    isProviderConnectionUsable({ authType: "apikey", apiKey: "sk-real" }),
-    true
-  );
-  assert.strictEqual(
-    isProviderConnectionUsable({ authType: "oauth", refreshToken: "rt" }),
-    true
-  );
+  const { isProviderConnectionUsable } =
+    await import("../../../src/lib/guardrails/visionBridge.ts");
+  assert.strictEqual(isProviderConnectionUsable({ authType: "noauth", apiKey: null }), false);
+  assert.strictEqual(isProviderConnectionUsable({ authType: "apikey", apiKey: "sk-real" }), true);
+  assert.strictEqual(isProviderConnectionUsable({ authType: "oauth", refreshToken: "rt" }), true);
   assert.strictEqual(
     isProviderConnectionUsable({ authType: "apikey", apiKey: "x", testStatus: "banned" }),
     false

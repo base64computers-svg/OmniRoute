@@ -196,6 +196,7 @@ test("callVisionModel passes custom API key", async () => {
 
 test("callVisionModel uses correct request body format", async () => {
   let capturedBody: Record<string, unknown> = {};
+  let capturedHeaders: Record<string, string> = {};
 
   const mockResponse = {
     ok: true,
@@ -207,6 +208,9 @@ test("callVisionModel uses correct request body format", async () => {
   globalThis.fetch = async (url: URL | RequestInfo, init?: RequestInit) => {
     if (init?.body) {
       capturedBody = JSON.parse(init.body as string);
+    }
+    if (init?.headers) {
+      capturedHeaders = init.headers as Record<string, string>;
     }
     return mockResponse as unknown as Response;
   };
@@ -224,6 +228,8 @@ test("callVisionModel uses correct request body format", async () => {
 
     // Verify request structure
     assert.strictEqual(capturedBody.model, "gpt-4o-mini");
+    assert.strictEqual(capturedBody.stream, false);
+    assert.strictEqual(capturedHeaders.Accept, "application/json");
     assert.ok(Array.isArray(capturedBody.messages));
     assert.strictEqual((capturedBody.messages as unknown[]).length, 1);
 
@@ -245,6 +251,71 @@ test("callVisionModel uses correct request body format", async () => {
     const textPart = message.content[1] as { type: string; text: string };
     assert.strictEqual(textPart.type, "text");
     assert.strictEqual(textPart.text, "What is in this image?");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("callVisionModel accepts OpenAI-compatible content-part arrays", async () => {
+  globalThis.fetch = async () =>
+    new Response(
+      JSON.stringify({
+        choices: [
+          {
+            message: {
+              content: [{ type: "output_text", text: "A terminal displaying an API error." }],
+            },
+          },
+        ],
+      }),
+      { status: 200, headers: { "Content-Type": "application/json" } }
+    );
+
+  try {
+    const result = await callVisionModel(
+      "data:image/png;base64,test123",
+      {
+        model: "openai/gpt-4o-mini",
+        prompt: "Describe this image",
+        timeoutMs: 30000,
+        maxImages: 10,
+      },
+      "sk-test-key"
+    );
+
+    assert.strictEqual(result, "A terminal displaying an API error.");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("callVisionModel accepts Responses-style output envelopes", async () => {
+  globalThis.fetch = async () =>
+    new Response(
+      JSON.stringify({
+        output: [
+          {
+            type: "message",
+            content: [{ type: "output_text", text: "A screenshot of request logs." }],
+          },
+        ],
+      }),
+      { status: 200, headers: { "Content-Type": "application/json" } }
+    );
+
+  try {
+    const result = await callVisionModel(
+      "data:image/png;base64,test123",
+      {
+        model: "openai/gpt-4o-mini",
+        prompt: "Describe this image",
+        timeoutMs: 30000,
+        maxImages: 10,
+      },
+      "sk-test-key"
+    );
+
+    assert.strictEqual(result, "A screenshot of request logs.");
   } finally {
     globalThis.fetch = originalFetch;
   }

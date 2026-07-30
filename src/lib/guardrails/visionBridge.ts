@@ -144,12 +144,14 @@ export class VisionBridgeGuardrail extends BaseGuardrail {
     // Declare before the conditional so they're available to the rest of preCall
     let forceVisionBridge = false;
     let comboVisionBridgeDecision: ComboVisionBridgeDecision | undefined;
+    let modelSupportsVision: boolean | null = null;
 
     if (!isAuto) {
       forceVisionBridge = isVisionBridgeForcedModel(model);
 
       // 4. Check if model supports vision
       const capabilities = getResolvedModelCapabilities(model);
+      modelSupportsVision = capabilities.supportsVision;
       comboVisionBridgeDecision = forceVisionBridge
         ? "process"
         : this.deps.checkModelHasComboMapping
@@ -297,6 +299,8 @@ export class VisionBridgeGuardrail extends BaseGuardrail {
       })
     );
 
+    const targetCannotSafelyReceiveImages = forceVisionBridge || modelSupportsVision === false;
+
     // Collect descriptions maintaining original order. A failed describe yields
     // `null` so the original image is preserved downstream (#4012) — replacing it
     // with an "(unavailable)" stub silently destroyed images for vision-capable
@@ -308,8 +312,24 @@ export class VisionBridgeGuardrail extends BaseGuardrail {
       const message =
         result.reason instanceof Error ? result.reason.message : String(result.reason);
       logger?.warn?.("VISION-BRIDGE", `Failed to get description for image ${i + 1}: ${message}`);
-      return null;
+      // A forced or positively identified text-only target cannot recover from
+      // the bridge failure itself. Preserving the raw image would only move the
+      // failure downstream as a provider 400, so inject an honest placeholder.
+      return targetCannotSafelyReceiveImages
+        ? `[Image ${i + 1}]: Image description unavailable.`
+        : null;
     });
+
+    // config.maxImages limits vision-model calls, not payload safety. Images
+    // beyond that limit must still be removed before a known/forced text-only
+    // target; otherwise a long Claude Code history fails on an older screenshot.
+    for (let i = limitedParts.length; i < imageParts.length; i++) {
+      descriptions.push(
+        targetCannotSafelyReceiveImages
+          ? `[Image ${i + 1}]: Image description skipped because the Vision Bridge image limit was reached.`
+          : null
+      );
+    }
 
     // 13. Replace image parts with text descriptions (null → keep original image)
     const modifiedBody = replaceImageParts(
@@ -322,7 +342,8 @@ export class VisionBridgeGuardrail extends BaseGuardrail {
       block: false,
       modifiedPayload: modifiedBody,
       meta: {
-        imagesProcessed: descriptions.length,
+        imagesDetected: imageParts.length,
+        imagesProcessed: limitedParts.length,
         // Keep meta observability stable: report a human label for failures.
         descriptions: descriptions.map((d, i) => d ?? `[Image ${i + 1}]: (unavailable)`),
         processingTimeMs: processingTime,

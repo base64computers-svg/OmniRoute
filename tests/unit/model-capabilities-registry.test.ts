@@ -205,6 +205,22 @@ test("GPT OSS and DeepSeek Reasoner models support tool calling", () => {
   assert.equal(deepseek.toolCalling, true);
 });
 
+test("native DeepSeek V4 models are text-only for image routing, including the ds alias", () => {
+  for (const model of [
+    "deepseek/deepseek-v4-pro",
+    "deepseek/deepseek-v4-flash",
+    "ds/deepseek-v4-pro",
+    "ds/deepseek-v4-flash",
+  ]) {
+    const capabilities = modelCapabilities.getResolvedModelCapabilities(model);
+    assert.equal(
+      capabilities.supportsVision,
+      false,
+      `${model} must not receive raw image_url content`
+    );
+  }
+});
+
 test("Kimi K2.6 supports vision capability", () => {
   const kimi = modelCapabilities.getResolvedModelCapabilities("kimi-k2.6");
   assert.equal(kimi.supportsVision, true);
