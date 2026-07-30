@@ -88,8 +88,10 @@ export function resolveVisionBridgeBaseUrl(model?: string): string {
 export interface ImagePart {
   messageIndex: number;
   partIndex: number;
+  /** Index path within message.content, including nested tool_result.content arrays. */
+  contentPath: number[];
   imageUrl: string;
-  imageType: "image_url" | "image";
+  imageType: "image_url" | "image" | "input_image";
 }
 
 export interface RequestMessage {
@@ -99,12 +101,80 @@ export interface RequestMessage {
 
 export type RequestContentPart =
   | { type: "text"; text: string }
-  | { type: "image_url"; image_url: { url: string; detail?: string } }
-  | { type: "image"; source: { type: "base64"; media_type: string; data: string } };
+  | { type: "input_text"; text: string }
+  | { type: "image_url"; image_url: string | { url: string; detail?: string } }
+  | {
+      type: "image";
+      source?: { type: "base64"; media_type: string; data: string } | { type: "url"; url: string };
+      image?: string;
+    }
+  | { type: "input_image"; image_url: string | { url: string } }
+  | { type: "tool_result"; tool_use_id?: string; content?: string | RequestContentPart[] };
+
+type ImageInput = Pick<ImagePart, "imageUrl" | "imageType">;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function readImageUrl(value: unknown): string | null {
+  if (typeof value === "string" && value.length > 0) return value;
+  if (!isRecord(value)) return null;
+  return typeof value.url === "string" && value.url.length > 0 ? value.url : null;
+}
+
+/**
+ * Normalize the image content-block shapes accepted elsewhere in OmniRoute:
+ * - OpenAI image_url (object and shorthand string forms)
+ * - Anthropic image source (base64 and URL forms)
+ * - AI SDK image string
+ * - Responses-style input_image
+ */
+function readImageInput(part: unknown): ImageInput | null {
+  if (!isRecord(part) || typeof part.type !== "string") return null;
+
+  if (part.type === "image_url") {
+    const imageUrl = readImageUrl(part.image_url);
+    return imageUrl ? { imageUrl, imageType: "image_url" } : null;
+  }
+
+  if (part.type === "input_image") {
+    const imageUrl = readImageUrl(part.image_url);
+    return imageUrl ? { imageUrl, imageType: "input_image" } : null;
+  }
+
+  if (part.type !== "image") return null;
+
+  const source = isRecord(part.source) ? part.source : null;
+  if (source?.type === "base64" && typeof source.data === "string" && source.data.length > 0) {
+    const mediaType =
+      typeof source.media_type === "string" && source.media_type.length > 0
+        ? source.media_type
+        : "image/png";
+    return {
+      imageUrl: `data:${mediaType};base64,${source.data}`,
+      imageType: "image",
+    };
+  }
+
+  if (source?.type === "url") {
+    const imageUrl = readImageUrl(source.url);
+    return imageUrl ? { imageUrl, imageType: "image" } : null;
+  }
+
+  if (typeof part.image === "string" && part.image.length > 0) {
+    return { imageUrl: part.image, imageType: "image" };
+  }
+
+  return null;
+}
 
 /**
  * Extract image parts from messages array.
- * Supports both OpenAI image_url format and base64 image format.
+ * Recurses through nested content arrays because Claude Code commonly carries
+ * screenshots inside tool_result.content. The Claude-to-OpenAI translator later
+ * lifts those screenshots into new image_url messages, so a top-level-only scan
+ * leaves text-only providers with an invalid final payload.
  */
 export function extractImageParts(messages: RequestMessage[]): ImagePart[] {
   const results: ImagePart[] = [];
@@ -113,32 +183,42 @@ export function extractImageParts(messages: RequestMessage[]): ImagePart[] {
     return results;
   }
 
-  for (let msgIdx = 0; msgIdx < messages.length; msgIdx++) {
-    const message = messages[msgIdx];
-    if (!message || !Array.isArray(message.content)) {
-      continue;
-    }
+  const visitContent = (
+    content: unknown[],
+    messageIndex: number,
+    parentPath: number[],
+    depth: number
+  ) => {
+    // HTTP JSON cannot contain cycles, but cap depth so a synthetic/internal
+    // payload cannot force unbounded recursion.
+    if (depth > 16) return;
 
-    for (let partIdx = 0; partIdx < message.content.length; partIdx++) {
-      const part = message.content[partIdx];
+    for (let partIndex = 0; partIndex < content.length; partIndex++) {
+      const part = content[partIndex];
+      const contentPath = [...parentPath, partIndex];
+      const image = readImageInput(part);
 
-      if (part?.type === "image_url" && part.image_url?.url) {
+      if (image) {
         results.push({
-          messageIndex: msgIdx,
-          partIndex: partIdx,
-          imageUrl: part.image_url.url,
-          imageType: "image_url",
+          messageIndex,
+          // Preserve the historical field's top-level meaning for callers/tests.
+          partIndex: contentPath[0] ?? partIndex,
+          contentPath,
+          ...image,
         });
-      } else if (part?.type === "image" && part.source?.type === "base64") {
-        const { media_type, data } = part.source;
-        const dataUri = `data:${media_type};base64,${data}`;
-        results.push({
-          messageIndex: msgIdx,
-          partIndex: partIdx,
-          imageUrl: dataUri,
-          imageType: "image",
-        });
+        continue;
       }
+
+      if (isRecord(part) && Array.isArray(part.content)) {
+        visitContent(part.content, messageIndex, contentPath, depth + 1);
+      }
+    }
+  };
+
+  for (let messageIndex = 0; messageIndex < messages.length; messageIndex++) {
+    const message = messages[messageIndex];
+    if (message && Array.isArray(message.content)) {
+      visitContent(message.content, messageIndex, [], 0);
     }
   }
 
@@ -192,6 +272,53 @@ async function normalizeVisionImageInput(
   }
 
   return normalizedImage;
+}
+
+/**
+ * Extract text from the response shapes returned by OpenAI-compatible
+ * gateways. Most return Chat Completions content as a string, but some
+ * adapters return content-part arrays or a Responses-style output envelope.
+ */
+function extractOpenAICompatibleText(data: unknown): string | null {
+  if (!data || typeof data !== "object") return null;
+
+  const root = data as Record<string, unknown>;
+  const choices = Array.isArray(root.choices) ? root.choices : [];
+  const firstChoice =
+    choices[0] && typeof choices[0] === "object" ? (choices[0] as Record<string, unknown>) : null;
+  const message =
+    firstChoice?.message && typeof firstChoice.message === "object"
+      ? (firstChoice.message as Record<string, unknown>)
+      : null;
+
+  const collectText = (value: unknown): string[] => {
+    if (typeof value === "string") {
+      return value.trim() ? [value] : [];
+    }
+    if (!Array.isArray(value)) return [];
+
+    return value.flatMap((part) => {
+      if (!part || typeof part !== "object") return [];
+      const record = part as Record<string, unknown>;
+      if (typeof record.text === "string" && record.text.trim()) {
+        return [record.text];
+      }
+      if (typeof record.output_text === "string" && record.output_text.trim()) {
+        return [record.output_text];
+      }
+      return collectText(record.content);
+    });
+  };
+
+  const chatText = collectText(message?.content).join("\n").trim();
+  if (chatText) return chatText;
+
+  if (typeof root.output_text === "string" && root.output_text.trim()) {
+    return root.output_text.trim();
+  }
+
+  const responsesText = collectText(root.output).join("\n").trim();
+  return responsesText || null;
 }
 
 export interface VisionModelConfig {
@@ -341,6 +468,7 @@ async function callVisionModelSingle(
       // Use sk_omniroute as fallback for self-loop if no API key is resolved.
       const selfLoopApiKey = resolvedApiKey || "sk_omniroute";
       const headers: Record<string, string> = {
+        Accept: "application/json",
         "Content-Type": "application/json",
         Authorization: `Bearer ${selfLoopApiKey}`,
       };
@@ -354,6 +482,7 @@ async function callVisionModelSingle(
         headers,
         body: JSON.stringify({
           model: requestModel,
+          stream: false,
           messages: [
             {
               role: "user",
@@ -404,9 +533,9 @@ async function callVisionModelSingle(
 
       return content.trim();
     } else {
-      // OpenAI-compatible response format: { choices: [{ message: { content: "..." } }] }
+      // OpenAI-compatible gateways can return a Chat Completions string, a
+      // content-part array, or a Responses-style output envelope.
       const openaiData = data as {
-        choices?: Array<{ message?: { content?: string } }>;
         error?: { message?: string };
       };
 
@@ -416,12 +545,12 @@ async function callVisionModelSingle(
         );
       }
 
-      const content = openaiData.choices?.[0]?.message?.content;
-      if (!content || typeof content !== "string") {
+      const content = extractOpenAICompatibleText(data);
+      if (!content) {
         throw new Error("Vision API returned empty or invalid response");
       }
 
-      return content.trim();
+      return content;
     }
   } catch (error) {
     clearTimeout(timeoutId);
@@ -462,33 +591,51 @@ export function replaceImageParts(
 
   let descriptionIndex = 0;
 
-  for (let msgIdx = 0; msgIdx < result.messages.length; msgIdx++) {
-    const message = result.messages[msgIdx];
-    if (!message || !Array.isArray(message.content)) {
-      continue;
-    }
+  const replaceContent = (content: unknown[], depth: number): unknown[] => {
+    if (depth > 16) return content;
 
-    const newContent: RequestContentPart[] = [];
-
-    for (const part of message.content) {
-      if (part?.type === "image_url" || part?.type === "image") {
-        if (descriptionIndex < descriptions.length) {
-          const description = descriptions[descriptionIndex];
-          descriptionIndex++;
-          if (description == null) {
-            // #4012: describe failed for this image — preserve the original
-            // image so a vision-capable upstream can still process it.
-            newContent.push(part as RequestContentPart);
-          } else {
-            newContent.push({ type: "text", text: description });
-          }
+    return content.map((part) => {
+      const image = readImageInput(part);
+      if (image) {
+        if (descriptionIndex >= descriptions.length) {
+          // Preserve images outside the processed range. The guardrail supplies
+          // explicit placeholders here for a known text-only target.
+          return part;
         }
-      } else {
-        newContent.push(part as RequestContentPart);
-      }
-    }
 
-    message.content = newContent;
+        const description = descriptions[descriptionIndex];
+        descriptionIndex++;
+        if (description == null) {
+          // #4012: describe failed for this image — preserve the original
+          // image so a vision-capable upstream can still process it.
+          return part;
+        }
+
+        const replacement: Record<string, unknown> = {
+          type: image.imageType === "input_image" ? "input_text" : "text",
+          text: description,
+        };
+        if (isRecord(part) && part.cache_control !== undefined) {
+          replacement.cache_control = part.cache_control;
+        }
+        return replacement;
+      }
+
+      if (isRecord(part) && Array.isArray(part.content)) {
+        return {
+          ...part,
+          content: replaceContent(part.content, depth + 1),
+        };
+      }
+
+      return part;
+    });
+  };
+
+  for (const message of result.messages) {
+    if (message && Array.isArray(message.content)) {
+      message.content = replaceContent(message.content, 0) as RequestContentPart[];
+    }
   }
 
   return result;

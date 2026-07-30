@@ -400,12 +400,21 @@ export function modelIdLikelyVision(modelId: string | null | undefined): boolean
  *
  * Xiaomi MiMo: only `mimo-v2.5` and `mimo-v2-omni` accept images; the `*-pro` chat
  * models are text-only (mimo.mi.com .../image-understanding; hermes-agent#18884).
- * Anchored to the full id (`$`) and tolerant of a `provider/` prefix so `mimo-v2.5-pro`
- * never matches the multimodal `mimo-v2.5`, and `mimo-v2-pro` never matches `mimo-v2-omni`.
+ *
+ * DeepSeek V4 Pro/Flash: the official Chat Completions schema accepts text message
+ * content, and the native API rejects `image_url` parts with "expected text". Keep
+ * these aliases text-only even if a synced catalog advertises image attachment.
+ *
+ * Patterns are anchored to the full id. DeepSeek is scoped to its native
+ * provider so a third-party host can still advertise a different vision contract.
  */
 const KNOWN_TEXT_ONLY_DESPITE_SYNC: readonly RegExp[] = [
   /(?:^|\/)mimo-v2\.5-pro$/i,
   /(?:^|\/)mimo-v2-pro$/i,
+  // Scope DeepSeek overrides to the native provider (or an unprefixed id).
+  // Third-party hosts may add their own multimodal preprocessing contract.
+  /^(?:deepseek\/)?deepseek-v4-pro$/i,
+  /^(?:deepseek\/)?deepseek-v4-flash$/i,
 ];
 
 function isKnownTextOnlyDespiteSync(modelId: string | null | undefined): boolean {
@@ -694,8 +703,7 @@ export function capThinkingBudget(input: CapabilityInput, budget: number): numbe
   // default to "gemini". Without this a cap learned via the executor would be
   // invisible to bare-model callers. Provider-qualified inputs keep their own
   // provider, preserving per-provider independence.
-  const providerForLearned =
-    resolved.provider ?? (modelLower.includes("gemini") ? "gemini" : null);
+  const providerForLearned = resolved.provider ?? (modelLower.includes("gemini") ? "gemini" : null);
 
   const learned = getLearnedThinkingCap(providerForLearned, modelId);
   if (learned !== null) {

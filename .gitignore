@@ -9,6 +9,7 @@ _ideia/
 _mono_repo/
 _references/
 _tasks/
+fix_patch/
 .agents/**
 .claude/**
 .gemini/**
