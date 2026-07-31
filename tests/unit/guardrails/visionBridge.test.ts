@@ -557,9 +557,7 @@ test("VB-DS-02: a failed bridge never forwards raw images to text-only DeepSeek"
     false
   );
   assert.equal(
-    content.some(
-      (part) => part.type === "text" && part.text === "[Image 1]: Image description unavailable."
-    ),
+    content.some((part) => part.type === "text" && part.text === "[Image 1]: unavailable"),
     true
   );
 });
@@ -733,7 +731,7 @@ test("VB-S09: respects maxImages without leaking remaining images to a text-only
     "images beyond maxImages must become safe text placeholders for a text-only target"
   );
   assert.equal(
-    finalJson.includes("Vision Bridge image limit was reached"),
+    finalJson.includes("skipped (limit)"),
     true,
     "the payload should disclose why remaining images were not described"
   );

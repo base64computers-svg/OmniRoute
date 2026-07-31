@@ -315,9 +315,7 @@ export class VisionBridgeGuardrail extends BaseGuardrail {
       // A forced or positively identified text-only target cannot recover from
       // the bridge failure itself. Preserving the raw image would only move the
       // failure downstream as a provider 400, so inject an honest placeholder.
-      return targetCannotSafelyReceiveImages
-        ? `[Image ${i + 1}]: Image description unavailable.`
-        : null;
+      return targetCannotSafelyReceiveImages ? `[Image ${i + 1}]: unavailable` : null;
     });
 
     // config.maxImages limits vision-model calls, not payload safety. Images
@@ -325,9 +323,7 @@ export class VisionBridgeGuardrail extends BaseGuardrail {
     // target; otherwise a long Claude Code history fails on an older screenshot.
     for (let i = limitedParts.length; i < imageParts.length; i++) {
       descriptions.push(
-        targetCannotSafelyReceiveImages
-          ? `[Image ${i + 1}]: Image description skipped because the Vision Bridge image limit was reached.`
-          : null
+        targetCannotSafelyReceiveImages ? `[Image ${i + 1}]: skipped (limit)` : null
       );
     }
 
